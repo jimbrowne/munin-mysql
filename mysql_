@@ -32,7 +32,7 @@ Non-default example:
     env.mysqlconnection DBI:mysql:mysql;host=127.0.0.1;port=3306
     env.mysqluser root
     env.mysqlpassword geheim
-
+    env.mysqlhbdb maindb
 
 =head2 Multiple instances
 
@@ -50,6 +50,11 @@ The plugin uses shared memory to cache the statistics gathered from
 MySQL. This ensures minimal inpact on the MySQL server.
 
 =item DBD::mysql
+
+=item mk-heartbeat from Maatkit
+
+If you chose to use the heartbeat graph, mk-heartbeat must be installed and
+the database containing the heartbeat table must be configured.
 
 =back
 
@@ -126,7 +131,7 @@ use POSIX qw(floor);
 our $data; # Was 'my'. Changed to 'our' to facilitate testing.
 
 
-my $has_cache;
+my ($has_cache, $has_mkhb);
 my $instance;
 my $shared_memory_cache;
 
@@ -134,6 +139,9 @@ my $shared_memory_cache;
 BEGIN {
     eval 'require Cache::SharedMemoryCache';
     $has_cache = $@ ? 0 : 1;
+
+    qx(which mk-heartbeat 2>&1 >/dev/null);
+    $has_mkhb = $? ? 0: 1;
 }
 
 
@@ -145,6 +153,7 @@ my %config = (
     'dsn'        => $ENV{'mysqlconnection'} || 'DBI:mysql:mysql',
     'user'       => $ENV{'mysqluser'}       || 'root',
     'password'   => $ENV{'mysqlpassword'}   || '',
+    'hbdb'       => $ENV{'mysqlhbdb'}   || '',
 );
 
 
@@ -753,6 +762,25 @@ $graphs{replication} = {
 
 #---------------------------------------------------------------------
 
+$graphs{heartbeat} = {
+    config => {
+	global_attrs => {
+	    title  => 'Maatkit Heartbeat',
+	    vlabel => 'Seconds behind master',
+	},
+	data_source_attrs => {
+	    draw => 'LINE1',
+	},
+    },
+    data_sources => [
+	{name => 'mk_heartbeat',   label => 'Slave Delay',
+					       type  => 'GAUGE',
+					       draw  => 'AREA'},
+    ],
+};
+
+#---------------------------------------------------------------------
+
 $graphs{select_types} = {
     config => {
         global_attrs => {
@@ -991,6 +1019,7 @@ sub suggest {
     #   SHOW SLAVE STATUS
 
     local $_;
+    delete $graphs{"heartbeat"} unless $has_mkhb;
     print "$_\n" for (sort keys(%graphs));
 
     return 0;
@@ -1091,6 +1120,11 @@ sub show {
     die "Can't show data for '$graph_name' because InnoDB is disabled."
         if $graph_name =~ /innodb_/ && $data->{_innodb_disabled};
 
+    if ($graph_name =~ /heartbeat/) {
+	die "Can't show data for '$graph_name' because mk-heartbeat is not present." if !$has_mkhb;
+	die "Can't show data for '$graph_name' because option hbdb is not set." if !$config{hbdb};
+    }
+
     for my $ds (@{$graph->{data_sources}}) {
         my $value = exists $ds->{value} 
             ? $ds->{value}($data) 
@@ -1165,6 +1199,7 @@ sub update_data {
     update_innodb($dbh);
     update_master($dbh);
     update_slave($dbh);
+    update_heartbeat() if ($has_mkhb && $config{hbdb});
     update_process_list($dbh);
 
     $shared_memory_cache->set('data', $data);
@@ -1262,6 +1297,23 @@ sub update_slave {
 
 }
 
+sub update_heartbeat {
+
+    my $host = "127.0.0.1";
+    if ($config{dsn} =~ m/.*host=([^;]*);/) {
+	$host = $1;
+    }
+    my $cmd = "mk-heartbeat --check ";
+    $cmd .= "-D $config{hbdb} ";
+    $cmd .= "-h $host ";
+    $cmd .= "-u $config{user} ";
+    $cmd .= "-p $config{password} " if ($config{password});
+
+    my $delay = qx($cmd 2>&1);
+    $delay = -1 if ($? || $delay !~ /\d+/);
+
+    $data->{mk_heartbeat} = $delay;
+}
 
 sub update_process_list {
     my ($dbh) = @_;
